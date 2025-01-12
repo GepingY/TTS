@@ -7,7 +7,7 @@ from PyQt6.QtCore import QSize, Qt, QThread, pyqtSignal
 from pathlib import Path
 import posixpath
 import edge_tts
-from pydub import AudioSegment
+
 import os
 import asyncio
 from docx import Document
@@ -16,6 +16,15 @@ import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 import random
+import threading
+
+import asyncio
+import random
+import shutil
+import wave
+import audioread
+
+import re
 
 class AudioWorker(QThread):
     progress_signal = pyqtSignal(int)
@@ -35,48 +44,80 @@ class AudioWorker(QThread):
         self.completed_signal.emit()
 
     def audio(self, word_pairs, path, progress_callback, Eng_repeat, Ch_repeat, silence_between_repeats, silence_between_innter_repeats):
-        async def create_tts_audio(text, lang, max_retries=5):
-            filename = f"{text}.mp3"
+        async def create_tts_audio(text, name, voice, max_retries=50):
+            #ShortText = ((((text.replace(" ", "_")).replace(",", "_")).replace("'", "_")).replace('"', '_')).replace(".", "_")
+            #max_filename_length = 100
+            #truncated_text = ShortText[:max_filename_length]
+            filename = f"{name}.mp3"
             retries = 0
             while retries < max_retries:
                 try:
-                    communicate = edge_tts.Communicate(text, voice=lang)
+                    # Generate TTS audio using edge_tts (same as before)
+                    communicate = edge_tts.Communicate(text, voice=voice)
                     await communicate.save(filename)
-                    return AudioSegment.from_mp3(filename)
-                except Exception:
+                    return filename
+                except Exception as e:
+                    print(f"Error generating TTS: {e}")
                     await asyncio.sleep(2 + random.uniform(0, 2))
                     retries += 1
             raise Exception(f"Failed to generate TTS for '{text}' after {max_retries} attempts.")
 
         async def generate_audio(word_pairs, path, progress_callback, Eng_repeat, Ch_repeat, silence_between_repeats, silence_between_innter_repeats):
-            final_audio = AudioSegment.silent(duration=0)  # Start with 0 second of silence
+            final_audio_files = []  # Store the MP3 files for combining later
             total_word_pairs = len(word_pairs)
-            print("word_pairs: ", word_pairs)
+
             for index, (eng, chi) in enumerate(word_pairs):
-                print("eng: ", eng)
-                eng_audio = await create_tts_audio(eng, lang='en-US-JennyNeural')
-                chi_audio = await create_tts_audio(chi, lang='zh-CN-YunyangNeural')
+                eng_filename = await create_tts_audio(eng, str(index), voice='en-US-JennyNeural')
+                chi_filename = await create_tts_audio(chi, str(str(index)+"second"), voice='zh-CN-YunyangNeural')
 
                 # Repeat English and Chinese
                 for _ in range(Eng_repeat):
-                    final_audio += eng_audio + AudioSegment.silent(duration=silence_between_innter_repeats)
+                    final_audio_files.append(eng_filename)
+                    final_audio_files.append(None)  # Represent silence
                 for _ in range(Ch_repeat):
-                    final_audio += chi_audio + AudioSegment.silent(duration=silence_between_innter_repeats)
+                    final_audio_files.append(chi_filename)
+                    final_audio_files.append(None)  # Represent silence
 
-                final_audio += AudioSegment.silent(duration=silence_between_repeats)
+                # Add silence between repeats
+                final_audio_files.append(None)
 
-                # Update progress (progress is based on percentage of word pairs processed)
+                # Update progress
                 progress = int((index + 1) * 100 / total_word_pairs)
                 progress_callback(progress)
 
-                # Clean up temporary files
-                os.remove(f"{eng}.mp3")
-                os.remove(f"{chi}.mp3")
 
-            final_audio.export(path, format="mp3")
+            final_audio = self.merge_audio_files(final_audio_files)
+
+
+            # Save the final audio as an MP3
+            with open(path, 'wb') as out_file:
+                out_file.write(final_audio)
+
+            for i in range(0, len(final_audio_files)):
+                if str(final_audio_files[i]) != "None":
+                    os.remove(str(final_audio_files[i]))
+                else:
+                    pass
 
         # Generate the final audio
+
         final_audio = asyncio.run(generate_audio(word_pairs, path, progress_callback, Eng_repeat, Ch_repeat, silence_between_repeats, silence_between_innter_repeats))
+
+    def merge_audio_files(self, audio_files):
+        final_audio = b''  # Start with an empty byte string
+
+        for file in audio_files:
+            if file:
+                # Read the MP3 file and append its content
+                with open(file, 'rb') as f:
+                    audio_content = f.read()
+                    final_audio += audio_content
+            else:
+                # Add silence (if None) -- simply add empty byte for now
+                silence_content = b'\0' * (self.silence_between_innter_repeats * 1000)  # Adjust silence duration
+                final_audio += silence_content
+
+        return final_audio
 
 
 #init################################################################
@@ -111,7 +152,6 @@ class MainWindow(QMainWindow):
         self.pushbutton_source.clicked.connect(self.select_input_path)
         self.pushbutton_choose.clicked.connect(self.select_output_path)
         self.spinBox_7.setValue(200)
-        print(app.style().objectName())
 
     def start(self):
         global double, option
@@ -355,16 +395,17 @@ class PDFWorker(QThread):
         self.spinBox_2_value = spinBox_2_value
 
     def run(self):
+        # Calculate the total number of pages across all PDFs for progress tracking
         total_pages = 0
-        # First, calculate the total number of pages across all PDFs for progress tracking
         for file in self.files_list:
             doc = fitz.open(file)
             total_pages += (len(doc) - self.spinBox_2_value) - self.start_page
             doc.close()
 
         pages_processed = 0
-        # Process each file individually
-        for i, file in enumerate(self.files_list):
+
+        def process_file(file, index):
+            nonlocal pages_processed  # Allow updating `pages_processed` in the nested function
             doc = fitz.open(file)
             num_pages_in_doc = len(doc)  # Get total pages for this document
 
@@ -372,7 +413,7 @@ class PDFWorker(QThread):
             end_page = min(num_pages_in_doc - self.spinBox_2_value, self.end_page)
 
             text = ""
-            print(f"Processing {file} from page {self.start_page} to {end_page}")
+
             
             for page_num in range(self.start_page, end_page):
                 page = doc.load_page(page_num)
@@ -388,13 +429,22 @@ class PDFWorker(QThread):
             doc.close()
 
             # Ensure each output file has a unique name
-            output_file = Path(self.output_path2, f"{Path(file).stem}_{i+1}.docx")
+            output_file = Path(self.output_path2, f"{Path(file).stem}_{index+1}.docx")
             self.create_docx(text, output_file)
-            print(f"Created {output_file}")
-            print(text)
+
+        # Process each file using a separate thread
+        threads = []
+        for i, file in enumerate(self.files_list):
+            thread = threading.Thread(target=process_file, args=(file, i))
+            threads.append(thread)
+            thread.start()
+
+        for thread in threads:
+            thread.join()
 
         # Emit completed signal
         self.completed_signal.emit()
+
 
 
 
@@ -531,7 +581,7 @@ class window2(QMainWindow):
                 QMessageBox.critical(
                     self,
                     '错误',
-                    '选中的文件非docx或者txt，请重新选择 E:0019'
+                    '选中的文件非docx或者txt，请新选择 E:0019'
                 )
                 return
             path2 = Path(filename)
@@ -544,6 +594,7 @@ class window2(QMainWindow):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    app.setStyle("fusion")
     widget = QtWidgets.QStackedWidget()
     mainwindow = MainWindow()
     window2 = window2()
